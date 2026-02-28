@@ -1,5 +1,8 @@
 
-use steel_core::prelude::*;
+use steel::steel_vm::engine::Engine;
+use steel::rvals::{SteelVal, Result};
+use steel::rerrs::{SteelErr, ErrorKind};
+use steel::steel_vm::register_fn::RegisterFn;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -13,7 +16,8 @@ async fn main() {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    let (event_sender, mut event_receiver) = mpsc::channel(100);
+    let (event_sender, event_receiver) = mpsc::channel::<String>(100);
+    let event_receiver = Arc::new(Mutex::new(event_receiver));
 
     let kernel_state = KernelState {
         processes: Arc::new(Mutex::new(HashMap::new())),
@@ -24,13 +28,22 @@ async fn main() {
 
     // --- Register Primitives ---
     let state_clone = kernel_state.clone();
-    vm.register_fn("lito/spawn", move |args: &[SteelVal]| {
-        let (command, rest) = args.split_first().ok_or_else(SteelErr::ArityMismatch)?;
-        let command_str = command.string_or_else(SteelErr::TypeMismatch)?;
-        let arg_vec: Vec<String> = rest
-            .iter()
-            .map(|v| v.string_or_else(SteelErr::TypeMismatch).map(|s| s.to_string()))
-            .collect::<Result<_, _>>()?;
+    vm.register_fn("lito/spawn", move |arg1: SteelVal, arg2: SteelVal| -> Result<SteelVal> {
+        let command_str = arg1.as_string().ok_or_else(|| SteelErr::new(ErrorKind::TypeMismatch, "lito/spawn expected a string command".to_string()))?;
+        let arg_vec = match &arg2 {
+            SteelVal::VectorV(v) => {
+                v.iter()
+                 .map(|v| v.as_string().map(|s| s.to_string()).ok_or_else(|| SteelErr::new(ErrorKind::TypeMismatch, "lito/spawn expected string arguments".to_string())))
+                 .collect::<Result<Vec<String>>>()?
+            },
+            _ => {
+                if let Some(s) = arg2.as_string() {
+                    vec![s.to_string()]
+                } else {
+                    vec![]
+                }
+            }
+        };
         lito_spawn(command_str.to_string(), arg_vec, state_clone.clone())
     });
 
@@ -44,12 +57,13 @@ async fn main() {
         lito_read_pty(id, state_clone.clone())
     });
 
-    let receiver_arc = Arc::new(Mutex::new(event_receiver));
-    vm.register_fn("lito/get-event", move || {
-        let mut receiver = receiver_arc.lock().unwrap();
-        match tokio::runtime::Handle::current().block_on(receiver.recv()) {
-            Some(event) => Ok(event),
-            None => Err(SteelErr::new(ErrorKind::Generic, "Event channel closed".to_string())),
+    let receiver_clone = Arc::clone(&event_receiver);
+    vm.register_fn("lito/get-event-blocking", move || {
+        let mut receiver = receiver_clone.lock().unwrap();
+        match receiver.try_recv() {
+            Ok(event) => Ok(SteelVal::StringV(event.into())),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(SteelVal::BoolV(false)),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(SteelErr::new(ErrorKind::Generic, "Event channel closed".to_string())),
         }
     });
 
@@ -57,7 +71,8 @@ async fn main() {
     let spec_path = Path::new("../SPECIFICA_CORE.scm");
     if spec_path.exists() {
         info!("Loading SPECIFICA_CORE.scm...");
-        if let Err(e) = vm.parse_and_eval_file(spec_path) {
+        let content = std::fs::read_to_string(spec_path).expect("Failed to read SPECIFICA_CORE.scm");
+        if let Err(e) = vm.compile_and_run_raw_program(content) {
             tracing::error!("Failed to load SPECIFICA_CORE.scm: {}", e);
         }
     } else {
@@ -65,5 +80,21 @@ async fn main() {
     }
 
     info!("Kernel initialized. Welcome to the Lito REPL!");
-    vm.repl().unwrap();
+    use std::io::{self, Write};
+    let mut input_buf = String::new();
+    loop {
+        print!("lito> ");
+        io::stdout().flush().unwrap();
+        input_buf.clear();
+        if io::stdin().read_line(&mut input_buf).unwrap() == 0 {
+            break;
+        }
+        let input = input_buf.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if let Err(e) = vm.compile_and_run_raw_program(input) {
+            println!("Error: {}", e);
+        }
+    }
 }
