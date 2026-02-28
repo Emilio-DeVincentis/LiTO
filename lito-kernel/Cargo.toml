@@ -1,0 +1,22 @@
+[package]
+name = "lito-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+steel-core = "0.7.0"
+portable-pty = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[lib]
+name = "lito_kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lito-kernel"
+path = "src/main.rs"
